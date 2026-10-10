@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# ZeroMQ IPC Sockets (Ignora ficheiros de comunicação local)
+*.ipc
+
+# OS
+.DS_Store
+Thumbs.db

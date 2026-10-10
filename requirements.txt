@@ -1,0 +1,12 @@
+pyzmq
+sounddevice
+deepfilternet
+pywhispercpp
+python-chess
+pyserial
+transitions
+numpy
+scipy
+onnxruntime
+#sudo apt install -y portaudio19-dev
+#sudo apt install -y stockfish
