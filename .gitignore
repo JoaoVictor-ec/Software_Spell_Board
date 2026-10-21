@@ -6,9 +6,17 @@ __pycache__/
 venv/
 ENV/
 
-# ZeroMQ IPC Sockets (Ignora ficheiros de comunicação local)
+# ZeroMQ IPC Sockets (Essencial para não travar a comunicação)
 *.ipc
 
-# OS
+# Ferramentas de terceiros clonadas
+stt/whisper.cpp/
+
+# Modelos pesados de IA (O GitHub bloqueia ficheiros > 100MB)
+*.bin
+*.onnx
+*.pt
+
+# SO
 .DS_Store
 Thumbs.db

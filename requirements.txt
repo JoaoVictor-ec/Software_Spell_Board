@@ -8,5 +8,6 @@ transitions
 numpy
 scipy
 onnxruntime
+stockfish
 #sudo apt install -y portaudio19-dev
 #sudo apt install -y stockfish

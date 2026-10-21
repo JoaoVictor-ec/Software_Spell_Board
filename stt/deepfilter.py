@@ -1,139 +1,128 @@
 import os
 import time
-import zmq
-from df import enhance, init_df
 import numpy as np
-import sounddevice as sd
-from scipy.signal import resample_poly
 import onnxruntime as ort
+import sounddevice as sd
+import zmq
 
-
-#send filtered audio
 context_a = zmq.Context()
 sender_a = context_a.socket(zmq.PUSH)
+sender_a.connect("ipc:///tmp/audio_filtrado.ipc")
 
-sender_a.bind("ipc:///tmp/audio_filtrado.ipc")
-
-# receives the context from the state machine, to know when to transcribe
 context_machine = zmq.Context()
-
 subscriber_machine = context_machine.socket(zmq.SUB)
-
 subscriber_machine.connect("ipc:///tmp/state_machine.ipc")
-
-#assing topics of state machine 
 subscriber_machine.setsockopt_string(zmq.SUBSCRIBE, 'PLAYER')
 subscriber_machine.setsockopt_string(zmq.SUBSCRIBE, 'MODEL')
 subscriber_machine.setsockopt_string(zmq.SUBSCRIBE, 'RESET')
 
-SAMPLE_RATE_IN = 48000   # DeepFilterNet (48 kHz) native freq
-SAMPLE_RATE_OUT = 16000  # Whisper (16 kHz) required freq
-# Frame of 100ms (4800 samples  48kHz -> 1600 samples  16kHz)
-FRAME_DURATION = 0.1 
-FRAME_SIZE_48K = int(SAMPLE_RATE_IN * FRAME_DURATION)
+SAMPLE_RATE = 16000
+FRAME_DURATION = 0.032  # 32ms = 512 amostras
+FRAME_SIZE = int(SAMPLE_RATE * FRAME_DURATION)  # 512
+CONTEXT_SIZE = 64  # Buffer de contexto exigido pelo Silero VAD v5 ONNX
 
-
-#load model
-print("loading DeepFilterNet...")
-df_model, df_state, _ = init_df()
-
-current_turn = 'MODEL'   # padronized state
-
-# Loads ONNX of Silero VAD in memorie, change path if needed
 VAD_MODEL_PATH = '/home/joao/oficinas2/Spell_nodes/stt/silero_vad.onnx'
 if not os.path.exists(VAD_MODEL_PATH):
-    print(f"Error: Vad model not found {VAD_MODEL_PATH}")
+    print(f"[ERRO ÁUDIO] Modelo VAD não encontrado em: {VAD_MODEL_PATH}", flush=True)
     exit(1)
+
 vad_session = ort.InferenceSession(VAD_MODEL_PATH)
-vad_state = np.zeros((2, 1, 128), dtype=np.float32)# Estado inicial do LSTM do Silero VAD?????
 
+vad_state = np.zeros((2, 1, 128), dtype=np.float32)
+vad_context = np.zeros(CONTEXT_SIZE, dtype=np.float32)
 
-#if the chance of speech passes the treshold reads audio
-def is_speech_silero(audio_16k_chunk, threshold=0.5):
-
-    global vad_state
+def is_speech_silero(audio_chunk, threshold=0.2, vol_threshold=0.12):
+    global vad_state, vad_context
     
-    # Perpare tensors especified for Silero VAD
+    input_audio = np.concatenate([vad_context, audio_chunk]).reshape(1, -1).astype(np.float32)
+    vad_context = audio_chunk[-CONTEXT_SIZE:]
+    
     inputs = {
-        'input': audio_16k_chunk.reshape(1, -1).astype(np.float32),
+        'input': input_audio,
         'state': vad_state,
-        'sr': np.int64(SAMPLE_RATE_OUT)
+        'sr': np.array(SAMPLE_RATE, dtype=np.int64)
     }
     
-    outputs = vad_session.run(None, inputs)
-    prob_speech = outputs[0][0][0]
-    vad_state = outputs[1]  # updtae LSTM for the next frame
+    try:
+        outputs = vad_session.run(None, inputs)
+        prob_speech = float(outputs[0].flatten()[0])
+        vad_state = outputs[1]
+    except Exception:
+        prob_speech = 0.0
+
+    max_vol = float(np.max(np.abs(audio_chunk)))
+    speech_detected = (prob_speech > threshold) or (max_vol > vol_threshold)
     
-    return prob_speech > threshold
+    return prob_speech, max_vol, speech_detected
 
 def reset_vad_state():
-    #resets silero vad when frase ends or turn ends
-    global vad_state
+    global vad_state, vad_context
     vad_state = np.zeros((2, 1, 128), dtype=np.float32)
+    vad_context = np.zeros(CONTEXT_SIZE, dtype=np.float32)
 
-current_turn = 'MODEL'
-speech_buffer = []          # Acumulate the 16kHz frames while player speaks
-is_speaking = False         # Flag indicating its on going
-silence_counter = 0         # counter for the silero frames
-MAX_SILENCE_CHUNKS = 25     # ~25 frames x 32ms ≈ 800ms of silence to end detection
+current_turn = 'PLAYER'
+speech_buffer = []
+is_speaking = False
+silence_counter = 0
+MAX_SILENCE_CHUNKS = 25  # ~800ms de silêncio encerra a frase
 
-print("starting mic capture...")
+print("[ÁUDIO] Captura iniciada em 16 kHz (ONNX + Context Buffer 64)...", flush=True)
 
-with sd.InputStream(samplerate=SAMPLE_RATE_IN, channels=1, dtype='float32', blocksize=FRAME_SIZE_48K) as stream: #config mic i/o here
+with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32', blocksize=FRAME_SIZE) as stream:
+    last_debug_time = time.time()
+    
     while True:
-        # Check turn
         try:
-            current_turn = subscriber_machine.recv_string(flags=zmq.NOBLOCK)
-            print(f"{current_turn} turn to play")
-            if current_turn != 'PLAYER':
-                speech_buffer.clear()
-                is_speaking = False
-                reset_vad_state()
-        except zmq.Again:
-            pass
+            # Drena e trata mensagens da State Machine sanitizando o sufixo FEN
+            while True:
+                try:
+                    raw_turn = subscriber_machine.recv_string(flags=zmq.NOBLOCK)
+                    state_tag = raw_turn.split()[0] if raw_turn else ''
+                    
+                    if state_tag.startswith('MODEL'):
+                        new_turn = 'MODEL'
+                    else:
+                        new_turn = 'PLAYER'
 
-        try:
-            #Always reads the mic
-            frame_48k, overflow = stream.read(FRAME_SIZE_48K)
-            
-            # process the filtered audio only if it is the players turn
+                    if new_turn != current_turn:
+                        current_turn = new_turn
+                        if current_turn != 'PLAYER':
+                            speech_buffer.clear()
+                            is_speaking = False
+                            reset_vad_state()
+                except zmq.Again:
+                    break
+
+            frame, _ = stream.read(FRAME_SIZE)
+
             if current_turn == 'PLAYER':
-                audio_48k = frame_48k.flatten()
+                audio_16k = frame.flatten()
+                prob_speech, max_vol, speech_detected = is_speech_silero(audio_16k)
 
-                # filter via deepfilternet
-                audio_limpo_48k = enhance(df_model, df_state, audio_48k)
-
-                #  Downsampling to 16kHz (1536 -> 512 amostras)
-                audio_16k = resample_poly(audio_limpo_48k, up=1, down=3).astype(np.float32)
-
-                #  Avaliation using Silero VAD via ONNX
-                speech_detected = is_speech_silero(audio_16k)
+                if time.time() - last_debug_time > 0.5 or speech_detected:
+                    print(f"[DEBUG ÁUDIO] Vol: {max_vol:.4f} | Prob VAD: {prob_speech:.4f}", flush=True)
+                    last_debug_time = time.time()
 
                 if speech_detected:
                     if not is_speaking:
-                        print("Voice detected...")
+                        print(f"*** VOZ DETECTADA! (Vol: {max_vol:.2f} | Prob: {prob_speech:.4f}) ***", flush=True)
                         is_speaking = True
-                    
                     speech_buffer.append(audio_16k)
                     silence_counter = 0
 
                 elif is_speaking:
-                    # Acumulates the silent parts between words
                     speech_buffer.append(audio_16k)
                     silence_counter += 1
 
-                    # if hit 800ms of silence, isn't speeking anymore
                     if silence_counter >= MAX_SILENCE_CHUNKS:
-                        print("No more speech ending transcription...")
-                        
+                        print("[ÁUDIO] Fim da fala. Enviando para o Whisper...", flush=True)
                         full_audio = np.concatenate(speech_buffer)
                         sender_a.send(full_audio.tobytes())
 
-                        # Reset the buffer and state of VAD
                         speech_buffer.clear()
                         is_speaking = False
                         silence_counter = 0
                         reset_vad_state()
 
         except Exception as e:
-            print(f"Error of audio: {e}")
+            print(f"[ERRO ÁUDIO]: {e}", flush=True)
